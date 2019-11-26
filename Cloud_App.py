@@ -19,8 +19,60 @@ import math
 import coco
 import utils
 import model as modellib
+import imagezmq
 
-#List of Class Names for Class IDs
+####################################################################################################################################################################
+#Much of the Object Detection and Message Passing Code in this Server method here is adatped (not a direct copy paste) from Adrian Rosebrocks PyImageSearch 
+#Tuturials and ImUtils Library: https://github.com/jrosebr1/imutils
+
+# List of Class Labels that MobileNet SSD was trained to detect
+CLASSES = ["background", "airplane", "bicycle", "bird", "boat",
+	   "bottle", "bus", "car", "cat", "chair", "cow", "dining table",
+	   "dog", "horse", "motorcycle", "person", "potted plant", "sheep",
+	   "sofa", "train", "tv"]
+
+#Global Detection Dictionary - Keeps track of the most recent round of detections for each camera made by the MobileNet SSD Object Detector
+GDD = {}
+SHUTDOWN = False
+OBJECT_THRESHOLD = 0.7
+def Server():
+	# We will be editing the Global Detection Dictionary
+	global GDD
+	
+	print("Standby, loading Object Detector...")
+        NN = cv2.dnn.readNetFromCaffe("./MobileNetSSD_deploy.prototxt", "./MobileNetSSD_deploy.caffemodel")
+	
+	#Initialize ImageHub
+	print("Awaiting Incoming Connection...")
+	ImageHub = imagezmq.ImageHub()
+
+	#Stream Loop
+	while not SHUTDOWN:
+		#Recieve camera name and acknowledge with a receipt reply
+		(CamName, Frame) = ImageHub.recv_image()
+		ImageHub.send_reply(b'OK')
+
+		#Check if new data is coming from a newly connected device
+		if CamName not in GDD:
+			print("Recieving new data from {}...".format(CamName))
+			GDD[CamName] = None
+
+		#Resize the image frame to have a width of 400 pixels and then normalize the data before forwarding through the Neural Network
+		h, w = Frame.shape[:2]			
+		Ratio = 400.0 / float(w)
+		Frame = cv2.resize(Frame, (400, int(h*Ratio)), cv2.INTER_AREA)
+		Data = cv2.dnn.blobFromImage(cv2.resize(Frame, (300, 300)), 0.007843, (300, 300), 127.5)
+
+		#Pass the Data through the MobileNet SSD Object Detector and obtain Predictions
+		NN.setInput(Data)
+		Detections = NN.forward()
+                
+                #Update most recent frame detections in Global Detection Dictionary
+		GDD[CamName] = Detections
+		
+####################################################################################################################################################################
+
+#List of Class Names for Class IDs (MSCOCO Categories, the Categories that Mask-RCNN was trained to recognize and detect)
 class_names = ('BG', 'person', 'bicycle', 'car', 'motorcycle', 'airplane',
 		       'bus', 'train', 'truck', 'boat', 'traffic light',
 		       'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird',
@@ -36,7 +88,7 @@ class_names = ('BG', 'person', 'bicycle', 'car', 'motorcycle', 'airplane',
 		       'keyboard', 'cell phone', 'microwave', 'oven', 'toaster',
 		       'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors',
 		       'teddy bear', 'hair drier', 'toothbrush')
-
+	
 # TODO: Implement an actual DataBase into this Class to Store Data 
 Image_Lock = Lock()
 class Database:
@@ -111,19 +163,21 @@ class Database:
 	def RemoveObjectDict(self, Category, Name):
 		del self.ObjDict[Category][Name]
 
-CamLock = Lock()
-CamLock2 = Lock()
+#CamLock = Lock()
+#CamLock2 = Lock()
 class Camera: 
 	Tracker = None #{Cat: {Name : [Time, New Image] Queue}}
+	TCheck = None #{Cat: {Name : Time} Time Checkpoints for most recent Tracking update
 	Model = None #Tensorflow Model
-	Server = "54.245.167.107:5000"
-	CameraID = 1
+	#Server = "54.245.167.107:5000"
+	#CameraID = 1
 
-	def __init__(self, Name, Ratio):
-		self.Name = Name #Name/Location
-		self.Ratio = Ratio
-		self.ID = str(Camera.CameraID)
-		Camera.CameraID+=1
+	def __init__(self, CamName, Ratio):
+		self.Name = CamName #Name/Location
+		self.MatchRatio = Ratio
+		self.TInterval = 60 # Minumum Number of Seconds to wait before adding another entry into the Tracker if Tracking an Object 
+		#self.ID = str(Camera.CameraID)
+		#Camera.CameraID+=1
 
 	def __Extract(self, Img, Mask):
 		#Apply Mask to Img
@@ -181,7 +235,7 @@ class Camera:
 		        Good_Matches = 0
 		        #Determine Good Matches
 		        for m,n in matches:
-		            if(m.distance < self.Ratio*n.distance):
+		            if(m.distance < self.MatchRatio*n.distance):
 		                Good_Matches+=1                   
 
 		        #Compare Color Histograms
@@ -200,57 +254,82 @@ class Camera:
 		            Box = BBs[i]
 		            Img = cv.rectangle(Img, (Box[1],Box[0]), (Box[3],Box[2]), (0,255,0), 3)
 		            
-		            global CamLock2
-		            with CamLock2:#May not be necessary because Queues are already thread safe
-		                #Add Image along with Snapshot Time to appropriate Tracker Queue
-		                try:
-		                    if(Status == 1):#Object is Detectable
-		                        Camera.Tracker[class_names[ID]][name].get()
-		                        Camera.Tracker[class_names[ID]][name].put((Time, Img))
-		                    else:#Object is Trackable.
-		                        Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
-		                except KeyError:
-		                    NewQ = Queue(maxsize=Overwrite) if (Overwrite!=None) else Queue()
-		                    NewQ.put((Time, Img))
-		                    if(class_names[ID] not in Camera.Tracker):
-		                    	Camera.Tracker[class_names[ID]] = {name : NewQ}
-		                    else:
-		                    	Camera.Tracker[class_names[ID]][name] = NewQ
-		                except queue.Full:
+		            #global CamLock2
+		            #with CamLock2:#May not be necessary because Queues are already thread safe
+		            #Add Image along with Snapshot Time to appropriate Tracker Queue
+		            try:
+		                if(Status == 1):#Object is Detectable
 		                    Camera.Tracker[class_names[ID]][name].get()
-		                    Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)                                                     
+	                            Camera.Tracker[class_names[ID]][name].put((Time, Img))
+					
+	                        else:#Object is Trackable.
+				    #Update the Tracker if enough time has passed since we last detected this object
+				    TCheck = datetime.now()
+				    if (TCheck - Camera.TCheck[class_names[ID]][name]).seconds > self.TInterval:
+	                                Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
+					Camera.TCheck[class_names[ID]][name] = TCheck
+				
+	                    except KeyError:
+	                        NewQ = Queue(maxsize=Overwrite) if (Overwrite!=None) else Queue()
+	                        NewQ.put((Time, Img))
+	                        if(class_names[ID] not in Camera.Tracker):
+				    Camera.Tracker[class_names[ID]] = {name : NewQ}
+				    Camera.TCheck[class_names[ID]] = {name : datetime.now()}
+		                else:
+				    Camera.Tracker[class_names[ID]][name] = NewQ
+				    Camera.TCheck[class_names[ID]] = {name : datetime.now()}
+				
+		            except queue.Full:
+				#Update the Tracker if enough time has passed since we last detected this object
+				#Also remove oldest detection from Tracking Queue because it's full
+				TCheck = datetime.now()
+                                if (TCheck - Camera.TCheck[class_names[ID]][name]).seconds > self.TInterval:
+		                    Camera.Tracker[class_names[ID]][name].get()
+	                            Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
+                                    Camera.TCheck[class_names[ID]][name] = TCheck
 
 	def Snapshot(self, Overwrite, DataObj):
-		#Fetch Image from the Server with HTTP Requests
-		global CamLock
-		with CamLock:
-		    print("Fetching Image")
-		    IP = "http://" + Camera.Server
-		    requests.put(IP, data=self.ID)
-		    Response = requests.get(IP)
-		    Image = base64.b64decode(json.loads(Response.text)['py/b64'])
-		    Img = cv.imdecode(np.frombuffer(Image, np.uint8), 1)
-		
-		
-		
-		
-		#Img = cv.imread("Cell_Phone.png")	
-		#print(Img.shape)
+		#Fetch Most Recent Camera Frame Detections
+		Detections = GDD[self.Name]
+
 		#Receive Time
 		T = datetime.datetime.now(pytz.utc)
 		Time = str(T.astimezone(pytz.timezone('US/Central')))
 
-		#Analyze Image
-		self.__Analyze(Img, Time, Overwrite, DataObj)	
+		#Loop over detections to see if there are any we care about. If so, proceed with further analysis.
+		Analysis = False
+		Categories = set(DataObj.ObjDict.keys())
+		for i in np.arange(Detections.shape[2]):
+			#Extract the Confidence Level (i.e. Probability) of the Prediction
+			Confidence = Detections[0, 0, i, 2]
+
+			#Supress Weak Predictions (those with a Confidence less than a specified threshold)
+			if Confidence >= OBJECT_THRESHOLD:
+				#Extract Class Index
+				index = int(Detections[0, 0, i, 1])
+				Class = CLASSES[index]
+				
+				#Check to see if we care about this class
+				if Class in Categories:
+				    Analysis = True
+				    break
+						
+		#Img = cv.imread("Cell_Phone.png")	
+		#print(Img.shape)
+		
+		#If Image Contains Any Objects of Interest Proceed with Analysis
+		if Analysis:
+		    #Analyze Image
+		    self.__Analyze(Img, Time, Overwrite, DataObj)	
 
 	def GetName(self):
 		return self.Name #Return Name/Location Info
 
 	def GetRatio(self):
-		return self.Ratio
+		return self.MatchRatio
 
 	def SetRatio(self, Ratio):
-		self.Ratio = Ratio
+		self.MatchRatio = Ratio
 
 	def GetTracker(Category, Name):
 		return Camera.Tracker[Category][Name]
@@ -261,17 +340,19 @@ class Camera:
 		    Cat = Camera.Tracker[Category]
 		    for key in Cat:
 		        Cat[key].queue.clear()
+			Camera.TCheck[Category][key] = None
+			
+		    Camera.Tracker[Category] = Cat
 		else:
 		    del Camera.Tracker[Category][Name]
+		    del Camera.TCheck[Category][Name]
 
 class User:
-	def __init__(self, Client, Client_Addr, Max_Frames=10, Frequency=0.05, DEFAULT_BUFF_SIZE=1024):
+	def __init__(self, Client, Client_Addr, Max_Frames=10, Frequency=1, DEFAULT_BUFF_SIZE=1024):
 		self.Client = Client
 		self.Client_Addr = Client_Addr
 		self.Overwrite = Max_Frames
-		
-		self.Snap_Freq = Frequency*60 ################################################################################
-		
+		self.Snap_Freq = Frequency # Number of Seconds to wait before making another Object Check
 		self.Buffer = DEFAULT_BUFF_SIZE
 		self.ThreadLock = Lock()
 		self.Pipe = Queue()
@@ -281,7 +362,7 @@ class User:
 
 	def __Worker(self, Name, Ratio, DB):
 		Cam = Camera(Name, Ratio)
-		while(self.Command!=-1):#Exit Command
+		while not SHUTDOWN:#Exit Command
 			#print("Current Command:",self.Command)
 			if(self.Command==0):
 				with self.ThreadLock:
@@ -309,7 +390,7 @@ class User:
 		Status = Data[5]
 					   
 		#Receive Uploaded Image
-		Response = requests.get("http://"+Camera.Server+"/User/")#Verify
+		Response = requests.get("http://"+Camera.Server+"/User/")#Verify ##########################################################
 		Image = base64.b64decode(json.loads(Response.text)['py/b64'])
 		Img = cv.imdecode(np.frombuffer(Image, np.uint8), 1)			
 
@@ -353,7 +434,7 @@ class User:
 				self.Client.send(bytes(str(Info[0]), "utf8"))
 				_, Img_encoded = cv.imencode(".png", Info[1])
 				IP = "http://"+Camera.Server+"/User/"
-				requests.put(IP, data=Img_encoded.tostring())#Verify
+				requests.put(IP, data=Img_encoded.tostring())#Verify #####################################################
 		
 			#Confirmation Message
 			self.Client.send(bytes("Object information retrieved.", "utf8"))
@@ -419,10 +500,16 @@ class User:
 			self.Command = 1
 			
 	def Run(self, DB):
-		Img = cv.imread("Camera1.png")
-		Camera.Model.detect([Img])
+		#Img = cv.imread("Camera1.png")
+		#Camera.Model.detect([Img])
+		
+		#Initialize WebSocket Server to recieve real-time images from Client Cameras
+		Threads = {}		
+		WebServer = Thread(target=Server)
+		Threads['__Server__'] = WebServer
+		WebServer.start()
+		
 		print("Server is ready")
-		Threads = {}
 		#The Interface with the Client and the Control Center of the Entire Program/Cloud Application		
 		while(True):
 			Data = self.Client.recv(self.Buffer).decode("utf8")
@@ -452,16 +539,16 @@ class User:
 				self.Client.send(bytes("Camera successfully added.", "utf8"))	
 				
 			elif(Data[0].lower()=="upload"):
-				self.__Upload(Data, DB, len(Threads))
+				self.__Upload(Data, DB, len(Threads) - 1)
 										
 			elif(Data[0].lower()=="info"):
-				self.__Download(Data, len(Threads))					
+				self.__Download(Data, len(Threads) - 1)					
 							
 			elif(Data[0].lower()=="clear"):
-				self.__Clear(Data, len(Threads))
+				self.__Clear(Data, len(Threads) - 1)
 				
 			elif(Data[0].lower()=="status"):
-				self.__Status(Data, DB, len(Threads))
+				self.__Status(Data, DB, len(Threads) - 1)
 									
 			elif(Data[0].lower()=="delete"):
 				#Delete Camera
@@ -482,7 +569,10 @@ class User:
 					self.Client.send(bytes("Camera successfully removed from network.", "utf8"))
 	
 			elif(Data[0].lower()=="shutdown"):
+			                global SHUTDOWN
+				        
 					#Initiate Server Shutdown
+					SHUTDOWN = True
 					self.Command=-1
 					for thread in Threads:
 						Threads[thread].join()
@@ -567,6 +657,85 @@ Dispatcher:
 		Get Descriptor Ratio
 		Set Descriptor Ratio	
 '''
+'''
+Old Code that was Deleted (at least that I rememberd/chose to place here):
+# Deleted Code:
+	#Frame Dictionary for storing the different frames from different cameras
+	FrameMap = {}
+	
+	#Dictionary logging the time when each camera was last active
+	ActiveCams = {}
+	
+	#Time when last activity check was performed
+	ActivityCheck = datetime.now()
 
+	#Estimate number of cameras and amount of time between each check for a single camera
+	EST_CAMS = 1
+	CHECK_PERIOD = 10
+
+	#Length of time between each activity check
+	ACTIME = EST_CAMS * CHECK_PERIOD
+	
+		try:
+	
+			#Update the last active time when we received data from this device	
+			ActiveCams[CamName] = datetime.now()
+
+					#Extract BoundingBox Information
+					BBox = Detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+					x1, y1, x2, y2 = BBox.astype('int')
+
+					#Draw the Box on the Image Frame
+					cv2.rectangle(Frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+					
+					#Label the Object on the Bounding Box
+					cv2.putText(Frame, Class, (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+					
+					#Save Test to File
+					cv2.imwrite("./Test.jpg", Frame)
+					
+			cv2.putText(Frame, CamName, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)					
+
+			#Construct the Montage from the Frames of every Active Camera
+			h, w = Frame.shape[:2]
+			Montages = Montagizer(FrameMap.values(), Frame.shape[:2], (MHeight, MWidth))
+			
+			#Display the montage(s) on screen
+			for i,Montage in enumerate(Montages):
+				cv2.imshow("Monitor {}:".format(i), Montage)
+				
+			#Perform an Activity Check if enough time has passed to warrant one
+			if (datetime.now() - ActivityCheck).seconds > ACTIME:
+				#Check each device to determine if still active
+				for CamName,Time in list(ActiveCams.items()):
+					#Remove Camera from Active Set of Cameras if no recent activity
+					if (datetime.now() - Time).seconds > ACTIME:
+						print("Lost connection to {}...".format(CamName))
+						del FrameMap[CamName]
+						del ActiveCams[CamName]
+				
+				#Update most recent Activity Check Time to now
+				ActivityCheck = datetime.now()
+
+			#cv2.imshow("Monitor 1", Frame)
+			cv2.waitKey(1)
+						
+		except Exception:
+			print("Either something went wrong or you killed the program. Either way shutting down...")
+			break
+			
+	#Nuke any leftover Open Windows in the Program
+	cv2.destroyAllWindows()
+
+		#Fetch Image from the Server with HTTP Requests
+		global CamLock
+		with CamLock:
+		    print("Fetching Image")
+		    IP = "http://" + Camera.Server
+		    requests.put(IP, data=self.ID)
+		    Response = requests.get(IP)
+		    Image = base64.b64decode(json.loads(Response.text)['py/b64'])
+		    Img = cv.imdecode(np.frombuffer(Image, np.uint8), 1)
+'''
 
 
