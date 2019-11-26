@@ -36,6 +36,8 @@ class_names = ('BG', 'person', 'bicycle', 'car', 'motorcycle', 'airplane',
 		       'keyboard', 'cell phone', 'microwave', 'oven', 'toaster',
 		       'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors',
 		       'teddy bear', 'hair drier', 'toothbrush')
+
+# TODO: Implement an actual DataBase into this Class to Store Data 
 Image_Lock = Lock()
 class Database:
 	def __init__(self):
@@ -55,14 +57,12 @@ class Database:
 		#If user specified object category was not detected in image use first detected class as default
 		Detections = np.where(Result[0]['class_ids'] == class_names.index(Category))
 		Index = Detections[0][0] if len(Detections[0] > 0) else 0
-			
-		Mask = Result[0]['masks'][:,:,Index]
-		h,w = Mask.shape[0:2]
-		New = np.zeros(w*h*3).reshape((h,w,3))
-		for i in range(3):
-		    New[:,:,i] = Mask
 		    
 		#Apply Mask to Img
+		Mask = Result[0]['masks'][:,:,Index]
+		h,w = Mask.shape[0:2]
+		New = np.empty((h,w,3), dtype=np.float32)
+		New[:,:,np.arange(3)] = Mask
 		Img[New==0] = 0
 		
 		#Extract ORB Features
@@ -80,7 +80,7 @@ class Database:
 		    raise KeyError        
 		if(Name not in self.ObjDict[Category]):
 		    raise KeyError
-		if(Value!=0 and Value!=1 and Value!=2):
+		if Value not in {0, 1, 2}:
 		    raise ValueError
 		    
 		self.ObjDict[Category][Name][0] = Value
@@ -88,7 +88,7 @@ class Database:
 	def SetObjDict(self, Category, Name, Model, Img, Thresh, CThresh, Status):
 		if(Category not in class_names):
 		    raise KeyError
-		if(Status!=0 and Status!=1 and Status!=2):
+		if Status not in {0, 1, 2}:
 		    raise ValueError
 		
 		#Raise ValueError if invalid Threshold Value     
@@ -97,12 +97,14 @@ class Database:
 		
 		#Extract Features
 		Desc, Hist = self.__Extract(Category, Model, Img)
-		print("Uploading Object")
+		print("Uploading Object...")
 		if Category not in self.ObjDict:
 			self.ObjDict[Category] = {Name : [Status, Thresh, Desc, CThresh, Hist]}#Thresh and Feature Values can be grouped into a Tuple
 		else:
 			self.ObjDict[Category][Name] = [Status, Thresh, Desc, CThresh, Hist]
-
+                
+		print("Object Uploaded")
+		
 	def GetObject(self, Category):
 		return self.ObjDict[Category]
 
@@ -113,7 +115,7 @@ CamLock = Lock()
 CamLock2 = Lock()
 class Camera: 
 	Tracker = None #{Cat: {Name : [Time, New Image] Queue}}
-	Model = None    #Tensorflow Model
+	Model = None #Tensorflow Model
 	Server = "54.245.167.107:5000"
 	CameraID = 1
 
@@ -165,8 +167,8 @@ class Camera:
 		    for name in ObjDict:
 		        print("Comparing with images in Object Database")
 		        Status = ObjDict[name][0]
-		        if(Status == 0):
-		            continue
+		        if(Status == 0): 
+			    continue
  
 		        THRESHOLD = ObjDict[name][1]
 		        Desc = ObjDict[name][2]
@@ -189,9 +191,11 @@ class Camera:
 			
 		        print("Good ORB Descriptor Matches:", Good_Matches)
 		        print("Color HDistance:", HDistance)
+			
 		        #Apply Match Thresholds to determine if there is a match
 		        if(THRESHOLD <= Good_Matches and HDistance <= CTHRESHOLD):
 		            print("Match Found!!!")
+			
 			    #Add bounding box to Img
 		            Box = BBs[i]
 		            Img = cv.rectangle(Img, (Box[1],Box[0]), (Box[3],Box[2]), (0,255,0), 3)
@@ -226,6 +230,9 @@ class Camera:
 		    Response = requests.get(IP)
 		    Image = base64.b64decode(json.loads(Response.text)['py/b64'])
 		    Img = cv.imdecode(np.frombuffer(Image, np.uint8), 1)
+		
+		
+		
 		
 		#Img = cv.imread("Cell_Phone.png")	
 		#print(Img.shape)
@@ -262,7 +269,9 @@ class User:
 		self.Client = Client
 		self.Client_Addr = Client_Addr
 		self.Overwrite = Max_Frames
-		self.Snap_Freq = Frequency*60
+		
+		self.Snap_Freq = Frequency*60 ################################################################################
+		
 		self.Buffer = DEFAULT_BUFF_SIZE
 		self.ThreadLock = Lock()
 		self.Pipe = Queue()
