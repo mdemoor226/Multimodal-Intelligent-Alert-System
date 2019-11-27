@@ -2,6 +2,8 @@ import numpy as np
 import cv2
 import imagezmq
 from datetime import datetime
+from PoseEstimator import Estimator
+import threading
 
 #Much of the Object Detection and Message Passing Code here is adatped (not a direct copy paste) from Adrian Rosebrocks PyImageSearch Tuturials and ImUtils Library:
 #https://github.com/jrosebr1/imutils
@@ -11,9 +13,7 @@ CLASSES = ["background", "airplane", "bicycle", "bird", "boat",
 	   "bottle", "bus", "car", "cat", "chair", "cow", "dining table",
 	   "dog", "horse", "motorcycle", "person", "potted plant", "sheep",
 	   "sofa", "train", "tv"]
-
-print("Standby, loading Object Detector...")
-NN = cv2.dnn.readNetFromCaffe("./MobileNetSSD_deploy.prototxt", "./MobileNetSSD_deploy.caffemodel")
+MONTAGES = None
 
 def Montagizer(Images, IShape, MShape):
 	h, w = IShape
@@ -45,10 +45,14 @@ def Montagizer(Images, IShape, MShape):
 	
 	return Montages
 
-def Server(MWidth, MHeight, CThreshold):
+def Server(MWidth=1, MHeight=1, CThreshold=0.7):
 	#Initialize ImageHub
 	print("Awaiting Incoming Connection...")
 	ImageHub = imagezmq.ImageHub()
+        
+	#Initialize and Load the Object Detector
+        print("Standby, loading Object Detector...")
+        NN = cv2.dnn.readNetFromCaffe("./MobileNetSSD_deploy.prototxt", "./MobileNetSSD_deploy.caffemodel")
 
 	#Frame Dictionary for storing the different frames from different cameras
 	FrameMap = {}
@@ -65,7 +69,10 @@ def Server(MWidth, MHeight, CThreshold):
 
 	#Length of time between each activity check
 	ACTIME = EST_CAMS * CHECK_PERIOD
-
+        
+	#Initialize Human Pose Estimator
+	HEstimator = Estimator()
+	
 	#Stream Loop
 	while True:
 		try:
@@ -91,6 +98,10 @@ def Server(MWidth, MHeight, CThreshold):
 			#Pass the Data through the MobileNet SSD Object Detector and obtain Predictions
 			NN.setInput(Data)
 			Detections = NN.forward()
+
+			#Pass the Image through the Human Pose Estimator and Obtain Visual Results
+			HEstimator.Analyze(Frame)
+			Frame = HEstimator.Visualize()
 			
 			for i in np.arange(Detections.shape[2]):
 				#Extract the Confidence Level (i.e. Probability) of the prediction
@@ -112,9 +123,6 @@ def Server(MWidth, MHeight, CThreshold):
 					
 					#Label the Object on the Bounding Box
 					cv2.putText(Frame, Class, (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-					
-					#Save Test to File
-					cv2.imwrite("./Test.jpg", Frame)
 			
 			#Write the Device name to be displayed on the recieved Image Frame
 			cv2.putText(Frame, CamName, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
@@ -124,15 +132,8 @@ def Server(MWidth, MHeight, CThreshold):
 			
 			#Construct the Montage from the Frames of every Active Camera
 			h, w = Frame.shape[:2]
-			Montages = Montagizer(FrameMap.values(), Frame.shape[:2], (MHeight, MWidth))
+			MONTAGES = Montagizer(FrameMap.values(), Frame.shape[:2], (MHeight, MWidth))
 			
-			#Display the montage(s) on screen
-			for i,Montage in enumerate(Montages):
-				cv2.imshow("Monitor {}:".format(i), Montage)
-
-			#cv2.imshow("Monitor 1", Frame)
-			cv2.waitKey(1)
-				
 			#Perform an Activity Check if enough time has passed to warrant one
 			if (datetime.now() - ActivityCheck).seconds > ACTIME:
 				#Check each device to determine if still active
@@ -150,12 +151,14 @@ def Server(MWidth, MHeight, CThreshold):
 			print("Either something went wrong or you killed the program. Either way shutting down...")
 			break
 
-	#Nuke any leftover Open Windows in the Program
-	cv2.destroyAllWindows()
-
-#Montage Dimensions
-MWidth = 1
-MHeight = 1
+def MessagePassing():
+	# Send Data Back to Client
+	pass
 
 if __name__=='__main__':
-	Server(MWidth, MHeight, 0.70)
+	WebServer = Thread(target=Server)
+	WebServer.start()
+	
+	MessagePassing()
+	WebServer.join()
+	
