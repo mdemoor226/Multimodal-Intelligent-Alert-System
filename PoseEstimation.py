@@ -8,7 +8,7 @@ sys.path.append('../../python');
 from openpose import pyopenpose as op
 
 class Estimator(object):
-    def __init__(self, model_path=None, face=True, hands=True):
+    def __init__(self, model_path="./../models", face=True, hands=True):
         self.face = face
         self.hands = hands
 
