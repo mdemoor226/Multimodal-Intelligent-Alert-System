@@ -3,14 +3,14 @@ import cv2
 import imagezmq
 from datetime import datetime
 
-#Much of the Object Detection and Message Passing Code here is adatped (not a direct copy paste) from Adrian Rosebrocks PyImageSearch Tuturials and ImUtils Library:
+#Much of the Object Detection and Message Passing Code here is adatped from Adrian Rosebrocks PyImageSearch Tuturials and ImUtils Library:
 #https://github.com/jrosebr1/imutils
 
 # List of Class Labels that MobileNet SSD was trained to detect
-CLASSES = ["background", "airplane", "bicycle", "bird", "boat",
-	   "bottle", "bus", "car", "cat", "chair", "cow", "dining table",
-	   "dog", "horse", "motorcycle", "person", "potted plant", "sheep",
-	   "sofa", "train", "tv"]
+CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
+	   "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
+	   "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
+	   "sofa", "train", "tvmonitor"]
 
 print("Standby, loading Object Detector...")
 NN = cv2.dnn.readNetFromCaffe("./MobileNetSSD_deploy.prototxt", "./MobileNetSSD_deploy.caffemodel")
