@@ -1,4 +1,5 @@
 import tensorflow as tf
+import keras.backend as K
 import numpy as np
 import cv2 as cv
 import queue
@@ -21,6 +22,10 @@ import utils
 import model as modellib
 import imagezmq
 
+config = tf.ConfigProto(allow_soft_placement=True)
+config.gpu_options.allow_growth = True
+K.tensorflow_backend.set_session(tf.Session(config=config))
+
 ####################################################################################################################################################################
 #Much of the Object Detection and Message Passing Code in this Server method here is adatped (not a direct copy paste) from Adrian Rosebrocks PyImageSearch 
 #Tuturials and ImUtils Library: https://github.com/jrosebr1/imutils
@@ -35,40 +40,42 @@ CLASSES = ["background", "airplane", "bicycle", "bird", "boat",
 GDD = {}
 SHUTDOWN = False
 OBJECT_THRESHOLD = 0.7
-def Server():
-	# We will be editing the Global Detection Dictionary
-	global GDD
-	
-	print("Standby, loading Object Detector...")
-        NN = cv2.dnn.readNetFromCaffe("./MobileNetSSD_deploy.prototxt", "./MobileNetSSD_deploy.caffemodel")
-	
-	#Initialize ImageHub
-	print("Awaiting Incoming Connection...")
-	ImageHub = imagezmq.ImageHub()
+def VideoServer():
+    # We will be editing the Global Detection Dictionary
+    global GDD
+    
+    print("Standby, loading Object Detector...")
+    NN = cv.dnn.readNetFromCaffe("./../../Backend/MobileNetSSD_deploy.prototxt", "./../../Backend/MobileNetSSD_deploy.caffemodel")
+    
+    #Initialize ImageHub
+    print("Awaiting Incoming Connection...")
+    ImageHub = imagezmq.ImageHub()
 
-	#Stream Loop
-	while not SHUTDOWN:
-		#Recieve camera name and acknowledge with a receipt reply
-		(CamName, Frame) = ImageHub.recv_image()
-		ImageHub.send_reply(b'OK')
+    #Stream Loop
+    while not SHUTDOWN:
+        #Recieve camera name and acknowledge with a receipt reply
+        (CamName, Frame) = ImageHub.recv_image()
+        ImageHub.send_reply(b'OK')
 
-		#Check if new data is coming from a newly connected device
-		if CamName not in GDD:
-			print("Recieving new data from {}...".format(CamName))
-			GDD[CamName] = None
+        #Check if new data is coming from a newly connected device
+        if CamName not in GDD:
+            print("Recieving new data from {}...".format(CamName))
+            GDD[CamName] = None
 
-		#Resize the image frame to have a width of 400 pixels and then normalize the data before forwarding through the Neural Network
-		h, w = Frame.shape[:2]			
-		Ratio = 400.0 / float(w)
-		Frame = cv2.resize(Frame, (400, int(h*Ratio)), cv2.INTER_AREA)
-		Data = cv2.dnn.blobFromImage(cv2.resize(Frame, (300, 300)), 0.007843, (300, 300), 127.5)
+        #Resize the image frame to have a width of 400 pixels and then normalize the data before forwarding through the Neural Network
+        h, w = Frame.shape[:2]			
+        Ratio = 400.0 / float(w)
+        #Frame = cv.resize(Frame, (400, int(h*Ratio)), cv.INTER_AREA)
+        Data = cv.dnn.blobFromImage(cv.resize(Frame, (300, 300)), 0.007843, (300, 300), 127.5)
 
-		#Pass the Data through the MobileNet SSD Object Detector and obtain Predictions
-		NN.setInput(Data)
-		Detections = NN.forward()
-                
-                #Update most recent frame detections in Global Detection Dictionary
-		GDD[CamName] = Detections
+        #Pass the Data through the MobileNet SSD Object Detector and obtain Predictions
+        NN.setInput(Data)
+        Detections = NN.forward()
+        
+        #Update most recent frame detections in Global Detection Dictionary
+        GDD[CamName] = (Detections, Frame)
+    
+    return
 		
 ####################################################################################################################################################################
 
@@ -89,7 +96,8 @@ class_names = ('BG', 'person', 'bicycle', 'car', 'motorcycle', 'airplane',
 		       'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors',
 		       'teddy bear', 'hair drier', 'toothbrush')
 	
-# TODO: Implement an actual DataBase into this Class to Store Data 
+# TODO: Implement an actual DataBase into this Class to Store Data
+GRAPH = None
 Image_Lock = Lock()
 class Database:
 	def __init__(self):
@@ -97,35 +105,37 @@ class Database:
 		
 	def __Extract(self, Category, Model, Img):
 		#########################################CONSIDER ADDING A LOCK HERE##############################################
-		global Image_Lock
-		with Image_Lock:
-			Result = Model.detect([Img])
+                global Image_Lock, GRAPH
+                with Image_Lock:
+                    with GRAPH.as_default():
+                        with tf.device('/gpu:1'):
+                            Result = Camera.Model.detect([Img])
 		
-		#Test for bad image
-		if(len(Result[0]['class_ids'])==0):
-			raise
+                #Test for bad image
+                if(len(Result[0]['class_ids'])==0):
+                    raise
 		
-		#Determine Index of Object Category in List of Detected Class_IDs. 
-		#If user specified object category was not detected in image use first detected class as default
-		Detections = np.where(Result[0]['class_ids'] == class_names.index(Category))
-		Index = Detections[0][0] if len(Detections[0] > 0) else 0
-		    
-		#Apply Mask to Img
-		Mask = Result[0]['masks'][:,:,Index]
-		h,w = Mask.shape[0:2]
-		New = np.empty((h,w,3), dtype=np.float32)
-		New[:,:,np.arange(3)] = Mask
-		Img[New==0] = 0
+                #Determine Index of Object Category in List of Detected Class_IDs. 
+                #If user specified object category was not detected in image use first detected class as default
+                Detections = np.where(Result[0]['class_ids'] == class_names.index(Category))
+                Index = Detections[0][0] if len(Detections[0] > 0) else 0
+                    
+                #Apply Mask to Img
+                Mask = Result[0]['masks'][:,:,Index]
+                h,w = Mask.shape[0:2]
+                New = np.empty((h,w,3), dtype=np.float32)
+                New[:,:,np.arange(3)] = Mask
+                Img[New==0] = 0
 		
-		#Extract ORB Features
-		Orb = cv.ORB_create()
-		_, Desc = Orb.detectAndCompute(cv.cvtColor(Img, cv.COLOR_BGR2GRAY), None)
-		
-		#Compute Color Histogram
-		Hist = cv.calcHist([Img], [0,1,2], Mask.astype(np.uint8), [16,16,16], [0,256,0,256,0,256])
-		Hist = cv.normalize(Hist, None).flatten()
-		print("Features Extracted")
-		return Desc, Hist 
+                #Extract ORB Features
+                Orb = cv.ORB_create()
+                _, Desc = Orb.detectAndCompute(cv.cvtColor(Img, cv.COLOR_BGR2GRAY), None)
+
+                #Compute Color Histogram
+                Hist = cv.calcHist([Img], [0,1,2], Mask.astype(np.uint8), [16,16,16], [0,256,0,256,0,256])
+                Hist = cv.normalize(Hist, None).flatten()
+                print("Features Extracted")
+                return Desc, Hist 
 
 	def SetStatus(self, Category, Name, Value):
 		if(Category not in class_names):
@@ -166,427 +176,536 @@ class Database:
 #CamLock = Lock()
 #CamLock2 = Lock()
 class Camera: 
-	Tracker = None #{Cat: {Name : [Time, New Image] Queue}}
-	TCheck = None #{Cat: {Name : Time} Time Checkpoints for most recent Tracking update
-	Model = None #Tensorflow Model
-	#Server = "54.245.167.107:5000"
-	#CameraID = 1
+    Tracker = None #{Cat: {Name : [Time, New Image] Queue}}
+    TCheck = None #{Cat: {Name : Time} Time Checkpoints for most recent Tracking update
+    Model = None #Tensorflow Model
+    #Server = "54.245.167.107:5000"
+    #CameraID = 1
 
-	def __init__(self, CamName, Ratio):
-		self.Name = CamName #Name/Location
-		self.MatchRatio = Ratio
-		self.TInterval = 60 # Minumum Number of Seconds to wait before adding another entry into the Tracker if Tracking an Object 
-		#self.ID = str(Camera.CameraID)
-		#Camera.CameraID+=1
+    def __init__(self, CamName, Ratio):
+            self.Name = CamName #Name/Location
+            self.MatchRatio = Ratio
+            self.TInterval = 60 # Minumum Number of Seconds to wait before adding another entry into the Tracker if Tracking an Object
+            self.FAST = True
+            #self.ID = str(Camera.CameraID)
+            #Camera.CameraID+=1
 
-	def __Extract(self, Img, Mask):
-		#Apply Mask to Img
-		Img[Mask==0] = 0
+    def __Extract(self, Img, Mask):
+            #Apply Mask to Img
+            Img[Mask==0] = 0
 
-		#Extract ORB Features
-		Orb = cv.ORB_create()
-		_, Desc = Orb.detectAndCompute(Img, None)
-		return Desc
+            #Extract ORB Features
+            Orb = cv.ORB_create()
+            _, Desc = Orb.detectAndCompute(Img, None)
+            return Desc
 
-	def __Analyze(self, Img, Time, Overwrite, DataObj):
-		#Analyze Image
-		######################CONSIDER ADDING A LOCK HERE#########################################################
-		#To Do List: Either figure out a way to apply Mutual Exclusion to the model or upgrade to more powerful EC2 Instance and allow each separate camera thread to
-		#have control over their own Copy of the Model (Alot of memory for a copy (~1 GB for each Model Copy?))
-		#print("Running Model")
-		global Image_Lock
-		with Image_Lock:
-			Result = Camera.Model.detect([Img])
-		
-		#Extract List of Detected Categories
-		IDs = Result[0]['class_ids']
-		Masks = Result[0]['masks']
-		BBs = Result[0]['rois']
-		
-		#print(IDs)
-		#Compare Detected Categories with those in DataBase
-		for i,ID in enumerate(IDs):
-		    try:
-		    	ObjDict = DataObj.GetObject(class_names[ID])
-		    except KeyError:
-		        continue
+    def __Analyze(self, Img, Time, Overwrite, DataObj):
+        #Analyze Image
+        ######################CONSIDER ADDING A LOCK HERE#########################################################
+        #To Do List: Either figure out a way to apply Mutual Exclusion to the model or upgrade to more powerful EC2 Instance and allow each separate camera thread to
+        #have control over their own Copy of the Model (Alot of memory for a copy (~1 GB for each Model Copy?))
+        #print("Running Model")
+        global Image_Lock, GRAPH
+        with Image_Lock:
+            with GRAPH.as_default():
+                with tf.device('/gpu:1'):
+                    Result = Camera.Model.detect([Img])
+                
+        #Extract List of Detected Categories
+        IDs = Result[0]['class_ids']
+        Masks = Result[0]['masks']
+        BBs = Result[0]['rois']
+        
+        #print(IDs)
+        #Compare Detected Categories with those in DataBase
+        for i,ID in enumerate(IDs):
+            try:
+                ObjDict = DataObj.GetObject(class_names[ID])
+            except KeyError:
+                continue
 
-		    print("Analyzing Image")
-		    #Extract ORB Features
-		    Features = self.__Extract(cv.cvtColor(Img, cv.COLOR_BGR2GRAY), Masks[:,:,i])
-		    Hist_New = cv.calcHist([Img], [0,1,2], Masks[:,:,i].astype(np.uint8), [16,16,16], [0,256,0,256,0,256])
-		    Hist_New = cv.normalize(Hist_New, None).flatten()
-	
-		    #Compare with those in all corresponding DataObj Database Queues
-		    for name in ObjDict:
-		        print("Comparing with images in Object Database")
-		        Status = ObjDict[name][0]
-		        if(Status == 0): 
-			    continue
- 
-		        THRESHOLD = ObjDict[name][1]
-		        Desc = ObjDict[name][2]
-		        CTHRESHOLD = ObjDict[name][3]
-		        Hist_Old = ObjDict[name][4]
+            print("Analyzing Image")
+            #Extract ORB Features
+            Features = self.__Extract(cv.cvtColor(Img, cv.COLOR_BGR2GRAY), Masks[:,:,i])
+            Hist_New = cv.calcHist([Img], [0,1,2], Masks[:,:,i].astype(np.uint8), [16,16,16], [0,256,0,256,0,256])
+            Hist_New = cv.normalize(Hist_New, None).flatten()
 
-		        BFM = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=False)
-		        matches = BFM.knnMatch(Features, Desc, k=2)
+            #Compare with those in all corresponding DataObj Database Queues
+            for name in ObjDict:
+                print("Comparing with images in Object Database")
+                Status = ObjDict[name][0]
+                if(Status == 0): 
+                    continue
 
-		        Good_Matches = 0
-		        #Determine Good Matches
-		        for m,n in matches:
-		            if(m.distance < self.MatchRatio*n.distance):
-		                Good_Matches+=1                   
+                THRESHOLD = ObjDict[name][1]
+                Desc = ObjDict[name][2]
+                CTHRESHOLD = ObjDict[name][3]
+                Hist_Old = ObjDict[name][4]
 
-		        #Compare Color Histograms
-		        HD1 = cv.compareHist(Hist_New, Hist_Old, cv.HISTCMP_CHISQR)
-		        HD2 = cv.compareHist(Hist_Old, Hist_New, cv.HISTCMP_CHISQR)
-		        HDistance = max(HD1,HD2)
-			
-		        print("Good ORB Descriptor Matches:", Good_Matches)
-		        print("Color HDistance:", HDistance)
-			
-		        #Apply Match Thresholds to determine if there is a match
-		        if(THRESHOLD <= Good_Matches and HDistance <= CTHRESHOLD):
-		            print("Match Found!!!")
-			
-			    #Add bounding box to Img
-		            Box = BBs[i]
-		            Img = cv.rectangle(Img, (Box[1],Box[0]), (Box[3],Box[2]), (0,255,0), 3)
-		            
-		            #global CamLock2
-		            #with CamLock2:#May not be necessary because Queues are already thread safe
-		            #Add Image along with Snapshot Time to appropriate Tracker Queue
-		            try:
-		                if(Status == 1):#Object is Detectable
-		                    Camera.Tracker[class_names[ID]][name].get()
-	                            Camera.Tracker[class_names[ID]][name].put((Time, Img))
-					
-	                        else:#Object is Trackable.
-				    #Update the Tracker if enough time has passed since we last detected this object
-				    TCheck = datetime.now()
-				    if (TCheck - Camera.TCheck[class_names[ID]][name]).seconds > self.TInterval:
-	                                Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
-					Camera.TCheck[class_names[ID]][name] = TCheck
-				
-	                    except KeyError:
-	                        NewQ = Queue(maxsize=Overwrite) if (Overwrite!=None) else Queue()
-	                        NewQ.put((Time, Img))
-	                        if(class_names[ID] not in Camera.Tracker):
-				    Camera.Tracker[class_names[ID]] = {name : NewQ}
-				    Camera.TCheck[class_names[ID]] = {name : datetime.now()}
-		                else:
-				    Camera.Tracker[class_names[ID]][name] = NewQ
-				    Camera.TCheck[class_names[ID]] = {name : datetime.now()}
-				
-		            except queue.Full:
-				#Update the Tracker if enough time has passed since we last detected this object
-				#Also remove oldest detection from Tracking Queue because it's full
-				TCheck = datetime.now()
-                                if (TCheck - Camera.TCheck[class_names[ID]][name]).seconds > self.TInterval:
-		                    Camera.Tracker[class_names[ID]][name].get()
-	                            Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
-                                    Camera.TCheck[class_names[ID]][name] = TCheck
+                BFM = cv.BFMatcher(cv.NORM_HAMMING, crossCheck=False)
+                matches = BFM.knnMatch(Features, Desc, k=2)
 
-	def Snapshot(self, Overwrite, DataObj):
-		#Fetch Most Recent Camera Frame Detections
-		Detections = GDD[self.Name]
+                Good_Matches = 0
+                #Determine Good Matches
+                for m,n in matches:
+                    if(m.distance < self.MatchRatio*n.distance):
+                        Good_Matches+=1                   
 
-		#Receive Time
-		T = datetime.datetime.now(pytz.utc)
-		Time = str(T.astimezone(pytz.timezone('US/Central')))
+                #Compare Color Histograms
+                HD1 = cv.compareHist(Hist_New, Hist_Old, cv.HISTCMP_CHISQR)
+                HD2 = cv.compareHist(Hist_Old, Hist_New, cv.HISTCMP_CHISQR)
+                HDistance = max(HD1,HD2)
+                
+                print("Good ORB Descriptor Matches:", Good_Matches)
+                print("Color HDistance:", HDistance)
+                
+                #Apply Match Thresholds to determine if there is a match
+                if(THRESHOLD <= Good_Matches and HDistance <= CTHRESHOLD):
+                    print("Match Found!!!")
+                
+                    #Add bounding box to Img
+                    Box = BBs[i]
+                    Img = cv.rectangle(Img, (Box[1],Box[0]), (Box[3],Box[2]), (0,255,0), 3)
+                    
+                    #global CamLock2
+                    #with CamLock2:#May not be necessary because Queues are already thread safe
+                    #Add Image along with Snapshot Time to appropriate Tracker Queue
+                    try:
+                        if(Status == 1):#Object is Detectable
+                            Camera.Tracker[class_names[ID]][name].get()
+                            Camera.Tracker[class_names[ID]][name].put((Time, Img))
 
-		#Loop over detections to see if there are any we care about. If so, proceed with further analysis.
-		Analysis = False
-		Categories = set(DataObj.ObjDict.keys())
-		for i in np.arange(Detections.shape[2]):
-			#Extract the Confidence Level (i.e. Probability) of the Prediction
-			Confidence = Detections[0, 0, i, 2]
+                        else:#Object is Trackable.
+                            #Update the Tracker if enough time has passed since we last detected this object
+                            TCheck = datetime.now()
+                            if (TCheck - Camera.TCheck[class_names[ID]][name]).seconds > self.TInterval:
+                                Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
+                                Camera.TCheck[class_names[ID]][name] = TCheck
+                    
+                    except KeyError:
+                        NewQ = Queue(maxsize=Overwrite) if (Overwrite!=None) else Queue()
+                        NewQ.put((Time, Img))
+                        if(class_names[ID] not in Camera.Tracker):
+                            Camera.Tracker[class_names[ID]] = {name : NewQ}
+                            Camera.TCheck[class_names[ID]] = {name : datetime.now()}
+                        else:
+                            Camera.Tracker[class_names[ID]][name] = NewQ
+                            Camera.TCheck[class_names[ID]] = {name : datetime.now()}
+                    
+                    except queue.Full:
+                        #Update the Tracker if enough time has passed since we last detected this object
+                        #Also remove oldest detection from Tracking Queue because it's full
+                        TCheck = datetime.now()
+                        if (TCheck - Camera.TCheck[class_names[ID]][name]).seconds > self.TInterval:
+                            Camera.Tracker[class_names[ID]][name].get()
+                            Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
+                            Camera.TCheck[class_names[ID]][name] = TCheck
 
-			#Supress Weak Predictions (those with a Confidence less than a specified threshold)
-			if Confidence >= OBJECT_THRESHOLD:
-				#Extract Class Index
-				index = int(Detections[0, 0, i, 1])
-				Class = CLASSES[index]
-				
-				#Check to see if we care about this class
-				if Class in Categories:
-				    Analysis = True
-				    break
-						
-		#Img = cv.imread("Cell_Phone.png")	
-		#print(Img.shape)
-		
-		#If Image Contains Any Objects of Interest Proceed with Analysis
-		if Analysis:
-		    #Analyze Image
-		    self.__Analyze(Img, Time, Overwrite, DataObj)	
+    def Snapshot(self, Overwrite, DataObj):
+        #If the current camera has not had any video frames processed yet do nothing
+        if self.Name not in GDD:
+            return
 
-	def GetName(self):
-		return self.Name #Return Name/Location Info
+        #Receive Time
+        T = datetime.datetime.now(pytz.utc)
+        Time = str(T.astimezone(pytz.timezone('US/Central')))
 
-	def GetRatio(self):
-		return self.MatchRatio
+        if self.FAST:
+            #Fetch Most Recent Camera Frame Detections
+            Detections = GDD[self.Name][0]
 
-	def SetRatio(self, Ratio):
-		self.MatchRatio = Ratio
+            #Loop over detections to see if there are any we care about. If so, proceed with further analysis.
+            Analysis = False
+            Categories = set(DataObj.ObjDict.keys())
+            for i in np.arange(Detections.shape[2]):
+                #Extract the Confidence Level (i.e. Probability) of the Prediction
+                Confidence = Detections[0, 0, i, 2]
 
-	def GetTracker(Category, Name):
-		return Camera.Tracker[Category][Name]
+                #Supress Weak Predictions (those with a Confidence less than a specified threshold)
+                if Confidence >= OBJECT_THRESHOLD:
+                    #Extract Class Index
+                    index = int(Detections[0, 0, i, 1])
+                    Class = CLASSES[index]
+                    
+                    #Check to see if we care about this class
+                    if Class in Categories:
+                        Analysis = True
+                        break
+        
+        else:
+            Analysis = True
+        
+        #Analysis = True						
+        #Img = cv.imread("Cell_Phone.png")	
+        #print(Img.shape)
+        
+        #If Image Contains Any Objects of Interest Proceed with Analysis
+        if Analysis:
+            #Analyze Image
+            Img = GDD[self.Name][1]
+            self.__Analyze(Img, Time, Overwrite, DataObj)	
 
-	def SetTracker(Category, Name=None):
-		#Purge Tracker Queue Or Delete Entire Tracker Queue				
-		if(Name == None):
-		    Cat = Camera.Tracker[Category]
-		    for key in Cat:
-		        Cat[key].queue.clear()
-			Camera.TCheck[Category][key] = None
-			
-		    Camera.Tracker[Category] = Cat
-		else:
-		    del Camera.Tracker[Category][Name]
-		    del Camera.TCheck[Category][Name]
+    def GetName(self):
+        return self.Name #Return Name/Location Info
+
+    def GetRatio(self):
+        return self.MatchRatio
+
+    def SetRatio(self, Ratio):
+        self.MatchRatio = Ratio
+
+    def GetTracker(Category, Name):
+        return Camera.Tracker[Category][Name]
+
+    def SetTracker(Category, Name=None):
+        #Purge Tracker Queue Or Delete Entire Tracker Queue				
+        if(Name == None):
+            Cat = Camera.Tracker[Category]
+            for key in Cat:
+                Cat[key].queue.clear()
+                Camera.TCheck[Category][key] = None
+                
+            Camera.Tracker[Category] = Cat
+        else:
+            del Camera.Tracker[Category][Name]
+            del Camera.TCheck[Category][Name]
+
+UPLOAD = None
+def UploadServer():
+    global UPLOAD
+    
+    #Initialize ImageHub
+    print("Upload Server Awaiting Incoming Connection...")
+    ImageHub = imagezmq.ImageHub(open_port='tcp://*:5556')
+
+    #Stream Loop
+    while not SHUTDOWN:
+        #Recieve camera name and Uploaded Image Frame and acknowledge with a receipt reply
+        (CamName, Upload) = ImageHub.recv_image()
+        ImageHub.send_reply(b'OK')
+        UPLOAD = Upload
+    
+    return
+
+DLock = Lock()
+DOWNLOADFRAMES = []
+def DownloadServer():
+    global NUMFRAMES, DLOCK, DOWNLOADFRAMES
+
+    # Send Images back to User Application
+    #SERVER_IP = "127.0.0.1" #Local workstation User App
+    SERVER_IP = "10.3.12.70" #Rpi User App #"172.24.118.97" #Change this as necessary
+
+    #Initialize Sender Object for the Server
+    print("Download Server Connecting to User...")
+    sleep(10)
+    Sender = imagezmq.ImageSender(connect_to="tcp://{}:5560".format(SERVER_IP))
+
+    #Obtain Hostname, initialize Video Stream, and Warm Up the Camera
+    ServerName = socket.gethostname()
+    
+    #Send the Processed Image Frames Back to the Client
+    while not SHUTDOWN:
+        with DLock:
+            for DownloadFRAME in DOWNLOADFRAMES:      
+                Sender.send_image(ServerName, DownloadFRAME)
+        
+        DOWNLOADFRAMES.clear()
+    
+    return
 
 class User:
-	def __init__(self, Client, Client_Addr, Max_Frames=10, Frequency=1, DEFAULT_BUFF_SIZE=1024):
-		self.Client = Client
-		self.Client_Addr = Client_Addr
-		self.Overwrite = Max_Frames
-		self.Snap_Freq = Frequency # Number of Seconds to wait before making another Object Check
-		self.Buffer = DEFAULT_BUFF_SIZE
-		self.ThreadLock = Lock()
-		self.Pipe = Queue()
-		self.Message = ""
-		self.Command = 0
-		self.Check = 0
+    def __init__(self, Client, Client_Addr, Max_Frames=10, Frequency=1, DEFAULT_BUFF_SIZE=1024):
+        self.Client = Client
+        self.Client_Addr = Client_Addr
+        self.Overwrite = Max_Frames
+        self.Snap_Freq = Frequency # Number of Seconds to wait before making another Object Check
+        self.Buffer = DEFAULT_BUFF_SIZE
+        self.ThreadLock = Lock()
+        self.Pipe = Queue()
+        self.Message = ""
+        self.Command = 0
+        self.Check = 0
+        self.Cameras = {}
 
-	def __Worker(self, Name, Ratio, DB):
-		Cam = Camera(Name, Ratio)
-		while not SHUTDOWN:#Exit Command
-			#print("Current Command:",self.Command)
-			if(self.Command==0):
-				with self.ThreadLock:
-					self.Check+=1
-				while(self.Command==0):
-					pass
-		
-			elif(self.Command==1):
-				Cam.Snapshot(self.Overwrite, DB)				
-				while(self.Command == 1):
-					#Take Periodic Snapshots
-					sleep(self.Snap_Freq)
-					Cam.Snapshot(self.Overwrite, DB)	
-			
-			elif(self.Command==2 and Name==self.Message):
-				break
-			else:
-				pass
+    def __Worker(self, Name, Ratio, DB):
+        self.Cameras[Name] = Camera(Name, Ratio)
+        while not SHUTDOWN:#Exit Command
+            #print("Current Command:",self.Command)
+            if(self.Command==0):
+                with self.ThreadLock:
+                    self.Check+=1
+                while(self.Command==0):
+                    pass
+    
+            elif(self.Command==1):
+                self.Cameras[Name].Snapshot(self.Overwrite, DB)				
+                while(self.Command == 1):
+                    #Take Periodic Snapshots
+                    sleep(self.Snap_Freq)
+                    self.Cameras[Name].Snapshot(self.Overwrite, DB)	
+            
+            elif(self.Command==2 and Name==self.Message):
+                break
+            else:
+                pass
 
-	def __Upload(self, Data, DB, Threads):
-		Category = Data[1].lower()
-		Name = Data[2]
-		Thresh = Data[3]
-		CThresh = Data[4]
-		Status = Data[5]
-					   
-		#Receive Uploaded Image
-		Response = requests.get("http://"+Camera.Server+"/User/")#Verify ##########################################################
-		Image = base64.b64decode(json.loads(Response.text)['py/b64'])
-		Img = cv.imdecode(np.frombuffer(Image, np.uint8), 1)			
+    def __Upload(self, Data, DB, Threads):
+        Category = Data[1].lower()
+        Name = Data[2]
+        Thresh = Data[3]
+        CThresh = Data[4]
+        Status = Data[5]
+                                   
+        #Receive Uploaded Image
+        Img = UPLOAD			
 
-		#Temporarily hold each thread in place
-		self.Command = 0
-		while(self.Check<Threads):
-			pass				
-		try:					
-			#Add New Object Information to Database
-			########Logic needs to be added here to determine what to do if no categories are detected in the user provided image##############
-			DB.SetObjDict(Category, Name, Camera.Model, Img, Thresh, CThresh, int(Status))
-	
-			#Confirmation Message
-			self.Client.send(bytes("Image successfully uploaded and features successfully extracted.", "utf8"))				
-		except (ValueError, KeyError):
-			#Send Error Message
-			self.Client.send(bytes("Error, either invalid category, invalid threshold value(s), or invalid status.", "utf8"))
-		except Exception:
-			#Send Other Error Message
-			self.Client.send(bytes("Error, something went wrong. Try to not upload a garbage image.", "utf8"))
-		finally:
-			#Release Threads
-			self.Check = 0
-			self.Command = 1	
-	
-	def __Download(self, Data, Threads):
-		#Send Object Info Back to User
-		Category = Data[1].lower()
-		Name = Data[2]
+        #Temporarily hold each thread in place
+        self.Command = 0
+        while(self.Check<Threads):
+            pass				
+        try:					
+            #Add New Object Information to Database
+            ########Logic needs to be added here to determine what to do if no categories are detected in the user provided image##############
+            DB.SetObjDict(Category, Name, Camera.Model, Img, Thresh, CThresh, int(Status))
 
-		#Temporarily hold each thread in place
-		self.Command = 0
-		while(self.Check<Threads):
-			pass				
-		try:
-			ObjQ = Camera.GetTracker(Category, Name)
-			self.Client.send(bytes(str(ObjQ.qsize()), "utf8"))
-			while not ObjQ.empty():
-				Info = ObjQ.get()
-				self.Client.recv(self.Buffer).decode("utf8")
-				self.Client.send(bytes(str(Info[0]), "utf8"))
-				_, Img_encoded = cv.imencode(".png", Info[1])
-				IP = "http://"+Camera.Server+"/User/"
-				requests.put(IP, data=Img_encoded.tostring())#Verify #####################################################
-		
-			#Confirmation Message
-			self.Client.send(bytes("Object information retrieved.", "utf8"))
-		except KeyError:
-			#Error Message
-			self.Client.send(bytes("Error, object does not exist.", "utf8"))
-		finally:
-			#Release Threads
-			self.Check = 0
-			self.Command = 1
-	
-	def __Clear(self, Data, Threads):
-		#Clear appropriate areas of Camera Tracker for Objects
-		Category = Data[1].lower()
-		Name = Data[2] if(Data[2]!="_") else None
+            #Confirmation Message
+            self.Client.send(bytes("Image successfully uploaded and features successfully extracted.", "utf8"))				
+        except (ValueError, KeyError):
+            #Send Error Message
+            self.Client.send(bytes("Error, either invalid category, invalid threshold value(s), or invalid status.", "utf8"))
+        except Exception:
+            #Send Other Error Message
+            self.Client.send(bytes("Error, something went wrong. Try to not upload a garbage image.", "utf8"))
+        finally:
+            #Release Threads
+            self.Check = 0
+            self.Command = 1	
+    
+    def __Download(self, Data, Threads):
+            global DLock, DOWNLOADFRAMES
+    		
+            #Send Object Info Back to User
+            Category = Data[1].lower()
+            Name = Data[2]
 
-		#Temporarily hold each thread in place
-		self.Command = 0
-		while(self.Check<Threads):
-			pass
-		try:
-			#Delete Tracker Category Queues or Specific Queue with Category and Name
-			Camera.SetTracker(Category, Name)
-	
-			#Confirmation Message
-			self.Client.send(bytes("Deletion successful.", "utf8"))
-		except KeyError:
-			#Send Error Message
-			self.Client.send(bytes("Error, invalid category or name.", "utf8"))
-		finally:
-			#Release Threads
-			self.Check=0
-			self.Command = 1
-	
-	def __Status(self, Data, DB, Threads):
-		#Set Object Status
-		Category = Data[1].lower()
-		Name = Data[2]
-		Status = Data[3]
+            #Temporarily hold each thread in place
+            self.Command = 0
+            while(self.Check<Threads):
+                    pass				
+            try:
+                Images = []
+                ObjQ = Camera.GetTracker(Category, Name)
+                self.Client.send(bytes(str(ObjQ.qsize()), "utf8"))
+                with DLock:
+                    while not ObjQ.empty():
+                        #Send Time Stamps Back to User
+                        Info = ObjQ.get()
+                        self.Client.recv(self.Buffer).decode("utf8")
+                        self.Client.send(bytes(str(Info[0]), "utf8"))
+                        
+                        #Collect Image Frames to Send Back to User
+                        Images.append(Info[1])
+                
+                    #Send the Frames Back to the User
+                    sleep(5)
+                    DOWNLOADFRAMES = Images
+                    
+                #Confirmation Message
+                self.Client.send(bytes("Object information retrieved.", "utf8"))
+            except KeyError:
+                #Error Message
+                self.Client.send(bytes("Error, object does not exist.", "utf8"))
+            finally:
+                #Release Threads
+                self.Check = 0
+                self.Command = 1
+    
+    def __Clear(self, Data, Threads):
+            #Clear appropriate areas of Camera Tracker for Objects
+            Category = Data[1].lower()
+            Name = Data[2] if(Data[2]!="_") else None
 
-		#Temporarily hold each thread in place
-		self.Command = 0
-		while(self.Check<Threads):
-			pass				
-		try:					
-			#Clear Camera Tracker of Current Images Relating to Previous Status
-			if(Category in Camera.Tracker):
-				if(Name in Camera.Tracker[Category]):
-					Camera.SetTracker(Category, Name)
-			
-			#Add New Object Information to Database
-			DB.SetStatus(Category, Name, int(Status))
-	
-			#Confirmation Message
-			self.Client.send(bytes("Object Status successfully updated.", "utf8"))				
-		except (ValueError, KeyError):
-			#Send Error Message
-			self.Client.send(bytes("Error, either category is invalid, ojbect name doesn't exist within category subset, \
-			or invalid status.", "utf8"))
-		finally:
-			#Release Threads
-			self.Check = 0
-			self.Command = 1
-			
-	def Run(self, DB):
-		#Img = cv.imread("Camera1.png")
-		#Camera.Model.detect([Img])
-		
-		#Initialize WebSocket Server to recieve real-time images from Client Cameras
-		Threads = {}		
-		WebServer = Thread(target=Server)
-		Threads['__Server__'] = WebServer
-		WebServer.start()
-		
-		print("Server is ready")
-		#The Interface with the Client and the Control Center of the Entire Program/Cloud Application		
-		while(True):
-			Data = self.Client.recv(self.Buffer).decode("utf8")
-			#print("Message From User:", Data)
-			if(Data==''):
-				#Connection Lost Shutdown Server
-				self.Command=-1
-				print("Error, connection to Client lost. Shutting down now.")
-				for thread in Threads:
-					Threads[thread].join()
-			
-				break
+            #Temporarily hold each thread in place
+            self.Command = 0
+            while(self.Check<Threads):
+                    pass
+            try:
+                    #Delete Tracker Category Queues or Specific Queue with Category and Name
+                    Camera.SetTracker(Category, Name)
+    
+                    #Confirmation Message
+                    self.Client.send(bytes("Deletion successful.", "utf8"))
+            except KeyError:
+                    #Send Error Message
+                    self.Client.send(bytes("Error, invalid category or name.", "utf8"))
+            finally:
+                    #Release Threads
+                    self.Check = 0
+                    self.Command = 1
+    
+    def __Speed(self, Data, Threads):
+            CamName = Data[1]
+            Speed = True if Data[2].lower=="true" else False
+            
+            #Temporarily hold each thread in place
+            self.Command = 0
+            while(self.Check<Threads):
+                pass
+            
+            try:
+                #Set the Speed Option
+                self.Cameras[CamName].FAST = Speed
+                
+                #Confirmation Message
+                self.Client.send(bytes("Speed option successfully updated.", "utf8"))
+            
+            except KeyError:
+                #Send Error Message
+                self.Client.send(bytes("Error. Camera does not exist.", "utf8"))
+            finally:
+                #Release Threads
+                self.Check = 0
+                self.Command = 1
+                
+    
+    def __Status(self, Data, DB, Threads):
+            #Set Object Status
+            Category = Data[1].lower()
+            Name = Data[2]
+            Status = Data[3]
 
-			Data = Data.split(",")
-			if(Data[0].lower()=="add"):
-				#Create new thread and throw it into Worker Function
-				Name = Data[1]
-				Ratio = float(Data[2])
-		
-				#Create New Camera Thread
-				self.Command = 1
-				Worker = Thread(target=self.__Worker, args=(Name, Ratio, DB))
-				Threads[Name] = Worker
-				Worker.start()
-		
-				#Confirmation Message
-				self.Client.send(bytes("Camera successfully added.", "utf8"))	
+            #Temporarily hold each thread in place
+            self.Command = 0
+            while(self.Check<Threads):
+                    pass				
+            try:					
+                    #Clear Camera Tracker of Current Images Relating to Previous Status
+                    if(Category in Camera.Tracker):
+                            if(Name in Camera.Tracker[Category]):
+                                    Camera.SetTracker(Category, Name)
+                    
+                    #Add New Object Information to Database
+                    DB.SetStatus(Category, Name, int(Status))
+    
+                    #Confirmation Message
+                    self.Client.send(bytes("Object Status successfully updated.", "utf8"))				
+            except (ValueError, KeyError):
+                    #Send Error Message
+                    self.Client.send(bytes("Error, either category is invalid, ojbect name doesn't exist within category subset, \
+                    or invalid status.", "utf8"))
+            finally:
+                    #Release Threads
+                    self.Check = 0
+                    self.Command = 1
+                    
+    def Run(self, DB):
+        #Img = cv.imread("Example.jpg")
+        #Camera.Model.detect([Img])
+        #with Image_Lock:
+        #    with tf.device('/gpu:1'):
+        #        Result = Camera.Model.detect([Img])
 				
-			elif(Data[0].lower()=="upload"):
-				self.__Upload(Data, DB, len(Threads) - 1)
-										
-			elif(Data[0].lower()=="info"):
-				self.__Download(Data, len(Threads) - 1)					
-							
-			elif(Data[0].lower()=="clear"):
-				self.__Clear(Data, len(Threads) - 1)
-				
-			elif(Data[0].lower()=="status"):
-				self.__Status(Data, DB, len(Threads) - 1)
-									
-			elif(Data[0].lower()=="delete"):
-				#Delete Camera
-				Name = Data[1]
-				
-				if(Name not in Threads):
-					self.Client.send(bytes("Error, Camera does not exist.", "utf8"))
-				else:
-					#Temporarily hold each thread in place
-					self.Message = Name
-					self.Command = 2
-					Threads[Name].join()
-					del Threads[Name]#Make sure exception isn't thrown here
-					self.Message = ""
-					self.Command = 1
-			
-					#Confirmation Message
-					self.Client.send(bytes("Camera successfully removed from network.", "utf8"))
-	
-			elif(Data[0].lower()=="shutdown"):
-			                global SHUTDOWN
-				        
-					#Initiate Server Shutdown
-					SHUTDOWN = True
-					self.Command=-1
-					for thread in Threads:
-						Threads[thread].join()
-			
-					#Confirmation Message
-					self.Client.send(bytes("Cameras successfully removed from network. System shutting down.", "utf8"))					
-					break
-			
-			else:
-				self.Client.send(bytes("Parsing Error.", "utf8"))						
+        #Initialize WebSocket Server to recieve real-time images from Client Cameras
+        print("Launching Server Threads...")
+        Threads = {}		
+        WebServer = Thread(target=VideoServer)
+        UpServer = Thread(target=UploadServer)
+        DownServer = Thread(target=DownloadServer)
+        Threads['__Server__'] = WebServer
+        Threads['__UpSever__'] = UpServer
+        Threads['__DownServer__'] = DownServer
+        WebServer.start()
+        UpServer.start()
+        DownServer.start()
+        
+        print("Server is ready")
+        #The Interface with the Client and the Control Center of the Entire Program/Cloud Application		
+        while(True):
+                Data = self.Client.recv(self.Buffer).decode("utf8")
+                #print("Message From User:", Data)
+                if(Data==''):
+                    #Connection Lost Shutdown Server
+                    self.Command=-1
+                    print("Error, connection to Client lost. Shutting down now.")
+                    for thread in Threads:
+                        Threads[thread].join()
+            
+                    break
+
+                Data = Data.split(",")
+                if(Data[0].lower()=="add"):
+                    #Create new thread and throw it into Worker Function
+                    Name = Data[1]
+                    Ratio = float(Data[2])
+                    
+                    if Name not in self.Cameras:
+                        #Create New Camera Thread
+                        self.Command = 1
+                        Worker = Thread(target=self.__Worker, args=(Name, Ratio, DB))
+                        Threads[Name] = Worker
+                        Worker.start()
+        
+                        #Confirmation Message
+                        self.Client.send(bytes("Camera successfully added.", "utf8"))
+                    
+                    else:
+                        self.Client.send(bytes("Error, Camera with that Name already Exists."))
+                
+                elif(Data[0].lower()=="speed"):
+                    self.__Speed(Data, len(Threads) - 3)
+                        
+                elif(Data[0].lower()=="upload"):
+                    self.__Upload(Data, DB, len(Threads) - 3)
+                                                                        
+                elif(Data[0].lower()=="info"):
+                    self.__Download(Data, len(Threads) - 3)					
+                                                
+                elif(Data[0].lower()=="clear"):
+                    self.__Clear(Data, len(Threads) - 3)
+                        
+                elif(Data[0].lower()=="status"):
+                    self.__Status(Data, DB, len(Threads) - 3)
+                                                                
+                elif(Data[0].lower()=="delete"):
+                    #Delete Camera
+                    Name = Data[1]
+                    
+                    if(Name not in Threads):
+                        self.Client.send(bytes("Error, Camera does not exist.", "utf8"))
+                    else:
+                        #Temporarily hold each thread in place
+                        self.Message = Name
+                        self.Command = 2
+                        Threads[Name].join()
+                        del Threads[Name]#Make sure exception isn't thrown here
+                        del self.Cameras[Name]
+                        self.Message = ""
+                        self.Command = 1
+        
+                        #Confirmation Message
+                        self.Client.send(bytes("Camera successfully removed from network.", "utf8"))
+
+                elif(Data[0].lower()=="shutdown"):
+                    global SHUTDOWN
+                    
+                    #Initiate Server Shutdown
+                    print("Shutting down...")
+                    SHUTDOWN = True
+                    self.Command=-1
+                    for thread in Threads:
+                            Threads[thread].join()
+    
+                    #Confirmation Message
+                    self.Client.send(bytes("Cameras successfully removed from network. System shutting down.", "utf8"))					
+                    break
+                
+                else:
+                    self.Client.send(bytes("Parsing Error.", "utf8"))						
 
 class InferenceConfig(coco.CocoConfig):
-	GPU_COUNT = 1
-	IMAGES_PER_GPU = 1
+    GPU_COUNT = 1
+    IMAGES_PER_GPU = 1
 
 #Dictionary to initialize Camera Tracker
 Track = {'BG' : {}, 'person' : {}, 'bicycle': {}, 'car': {}, 'motorcycle': {}, 'airplane': {}, 'bus': {}, 
@@ -603,33 +722,35 @@ Track = {'BG' : {}, 'person' : {}, 'bicycle': {}, 'car': {}, 'motorcycle': {}, '
 		 'vase': {}, 'scissors': {}, 'teddy bear': {}, 'hair drier': {}, 'toothbrush': {}}
 	
 if __name__ == '__main__':
-	DB = Database()
-	ROOT_DIR = os.getcwd()
-	MODEL_DIR = os.path.join(ROOT_DIR, "logs")
-	COCO_MODEL_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
-	if not os.path.exists(COCO_MODEL_PATH):
-		utils.download_trained_weights(COCO_MODEL_PATH)
+    DB = Database()
+    ROOT_DIR = os.getcwd()
+    MODEL_DIR = os.path.join(ROOT_DIR, "logs")
+    COCO_MODEL_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
+    if not os.path.exists(COCO_MODEL_PATH):
+        utils.download_trained_weights(COCO_MODEL_PATH)
+        print("Successfully downloaded model.")
 
-	config = InferenceConfig()
-	Camera.Model = modellib.MaskRCNN(mode="inference", model_dir=MODEL_DIR, config=config)
-	Camera.Model.load_weights(COCO_MODEL_PATH, by_name=True)
-	Camera.Tracker = Track	
+    config = InferenceConfig()
+    Camera.Model = modellib.MaskRCNN(mode="inference", model_dir=MODEL_DIR, config=config)
+    Camera.Model.load_weights(COCO_MODEL_PATH, by_name=True)
+    Camera.Tracker = Track
+    GRAPH = tf.get_default_graph()
+    
+    print("Successfully loaded model. Connecting to user now...")
+    Server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    Server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    Server.bind(('0.0.0.0', 10000)) 
 
-	print("Successfully loaded model. Connecting to user now")
-	Server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	Server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-	Server.bind(('0.0.0.0', 10000)) 
+    #This part of the program can be changed in the future to accept connections from multiple users and divide each user load into
+    #a separate process
+    Server.listen(1)
+    Client, Client_Addr = Server.accept()
+    print("Connection Established") 
+    User1 = User(Client, Client_Addr)
+    User1.Run(DB)
 
-	#This part of the program can be changed in the future to accept connections from multiple users and divide each user load into
-	#a separate process
-	Server.listen(1)
-	Client, Client_Addr = Server.accept()
-	print("Connection Established") 
-	User1 = User(Client, Client_Addr)
-	User1.Run(DB)
-
-	Server.shutdown(0)         
-	Server.close() 
+    Server.shutdown(0)         
+    Server.close() 
 	
 
 '''				 

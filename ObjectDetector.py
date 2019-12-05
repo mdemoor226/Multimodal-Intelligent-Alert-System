@@ -2,25 +2,27 @@ import numpy as np
 import cv2
 import imagezmq
 from datetime import datetime
+from Estimation import Estimator
+import socket
+from time import sleep
+from threading import Thread
 
-#Much of the Object Detection and Message Passing Code here is adatped from Adrian Rosebrocks PyImageSearch Tuturials and ImUtils Library:
+#Much of the Object Detection and Message Passing Code here is adapted from Adrian Rosebrocks PyImageSearch Tuturials and ImUtils Library:
 #https://github.com/jrosebr1/imutils
 
 # List of Class Labels that MobileNet SSD was trained to detect
-CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
-	   "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
-	   "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
-	   "sofa", "train", "tvmonitor"]
+CLASSES = ["background", "airplane", "bicycle", "bird", "boat",
+	   "bottle", "bus", "car", "cat", "chair", "cow", "dining table",
+	   "dog", "horse", "motorcycle", "person", "potted plant", "sheep",
+	   "sofa", "train", "tv"]
 
-print("Standby, loading Object Detector...")
-NN = cv2.dnn.readNetFromCaffe("./MobileNetSSD_deploy.prototxt", "./MobileNetSSD_deploy.caffemodel")
-
+STREAM = False
+FRAME = None
 def Montagizer(Images, IShape, MShape):
 	h, w = IShape
 	mh, mw = MShape
 	
 	#Squeeze as many images as possible into Montage frame. Once no more fit create a new Montage frame and start again.
-	Montages = []
 	ypos, xpos = 0, 0
 	ymax, xmax = h*mh, w*mw
 	Montage = np.zeros((mh*h, mw*w, 3), dtype=np.uint8)
@@ -32,130 +34,143 @@ def Montagizer(Images, IShape, MShape):
 		if xpos >= xmax:
 			ypos += h
 			xpos = 0
-			
-			#If no more room left in montage frame save the frame, reset, and move onto new frame
-			if ypos >= ymax:
-				ypos = 0
-				Montages.append(Montage)
-				Montage = np.zeros((mh*h, mw*w, 3), dtype=np.uint8)
 	
-	#Account for any unfinished montage if one exists
-	if xpos + ypos > 0:
-		Montages.append(Montage)
-	
-	return Montages
+	return Montage
 
-def Server(MWidth, MHeight, CThreshold):
-	#Initialize ImageHub
-	print("Awaiting Incoming Connection...")
-	ImageHub = imagezmq.ImageHub()
+def Server(NumCams=1, CThreshold=0.7):
+    global STREAM, FRAME
+    assert 0 < NumCams <= 4, "Error, only a maximum of 4 (and a minimum of 1) cameras are supported at this time."
+    if NumCams == 1:
+        MWidth = 1
+        MHeight = 1
+    elif NumCams == 2:
+        MWidth = 1
+        MHeight = 1
+    else:
+        MWidth = 2
+        MHeight =2
 
-	#Frame Dictionary for storing the different frames from different cameras
-	FrameMap = {}
+    print("Standby, loading Object Detector...")
+    NN = cv2.dnn.readNetFromCaffe("./MobileNetSSD_deploy.prototxt", "./MobileNetSSD_deploy.caffemodel")
 
-	#Dictionary logging the time when each camera was last active
-	ActiveCams = {}
+    #Initialize ImageHub
+    print("Awaiting Incoming Connection...")
+    ImageHub = imagezmq.ImageHub(open_port='tcp://*:5580')
 
-	#Time when last activity check was performed
-	ActivityCheck = datetime.now()
+    print("Standby, loading Object Detector...")
+    NN = cv2.dnn.readNetFromCaffe("./MobileNetSSD_deploy.prototxt", "./MobileNetSSD_deploy.caffemodel")
 
-	#Estimate number of cameras and amount of time between each check for a single camera
-	EST_CAMS = 1
-	CHECK_PERIOD = 10
+    #Frame Dictionary for storing the different frames from different cameras
+    FrameMap = {}
+    
+    #Initialize Human Pose Estimator
+    HEstimator = Estimator()
+    
+    #Stream Loop
+    STREAM = True
+    while STREAM:
+        #Recieve camera name and acknowledge with a receipt reply
+        (CamName, Frame) = ImageHub.recv_image()
+        ImageHub.send_reply(b'OK')
+        
+        #print("Image Received!!!")
+        #print(Frame)
+        #Check if new data is coming from a newly connected device
+        if CamName not in FrameMap:
+            print("Recieving new data from {}...".format(CamName))
+        
+        #Resize the image frame to have a width of 400 pixels and then normalize the data before forwarding through the Neural Network
+        h, w = Frame.shape[:2]			
+        Ratio = 400.0 / float(w)
+        #Frame = cv2.resize(Frame, (400, int(h*Ratio)), cv2.INTER_AREA)
+        Data = cv2.dnn.blobFromImage(cv2.resize(Frame, (300, 300)), 0.007843, (300, 300), 127.5)
 
-	#Length of time between each activity check
-	ACTIME = EST_CAMS * CHECK_PERIOD
+        #Pass the Data through the MobileNet SSD Object Detector and obtain Predictions
+        NN.setInput(Data)
+        Detections = NN.forward()
+        
+        for i in np.arange(Detections.shape[2]):
+            #Extract the Confidence Level (i.e. Probability) of the prediction
+            Confidence = Detections[0, 0, i, 2]
+                
+            #Supress Weak Predictions (those with a Confidence less than a specified threshold)
+            if Confidence >= CThreshold:
+                #print("Detected Something!!!")
+                
+                #Extract Class Index
+                index = int(Detections[0, 0, i, 1])
+                Class = CLASSES[index]
+                if Class == "person":
+                    HEstimator.Analyze(Frame)
+                    Frame = HEstimator.Visualize()
+                
+                #Extract BoundingBox Information
+                BBox = Detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                x1, y1, x2, y2 = BBox.astype('int')
+                
+                #Draw the Box on the Image Frame
+                cv2.rectangle(Frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                
+                #Label the Object on the Bounding Box
+                cv2.putText(Frame, Class, (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                
+                #Save Test to File
+                #cv2.imwrite("./Test.jpg", Frame)
+        
+        #Write the Device name to be displayed on the recieved Image Frame
+        cv2.putText(Frame, CamName, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-	#Stream Loop
-	while True:
-		try:
-			#Recieve camera name and acknowledge with a receipt reply
-			(CamName, Frame) = ImageHub.recv_image()
-			ImageHub.send_reply(b'OK')
-			
-			#print("Image Received!!!")
-			#print(Frame)
-			#Check if new data is coming from a newly connected device
-			if CamName not in ActiveCams:
-				print("Recieving new data from {}...".format(CamName))
-			
-			#Update the last active time when we received data from this device	
-			ActiveCams[CamName] = datetime.now()
-			
-			#Resize the image frame to have a width of 400 pixels and then normalize the data before forwarding through the Neural Network
-			h, w = Frame.shape[:2]			
-			Ratio = 400.0 / float(w)
-			Frame = cv2.resize(Frame, (400, int(h*Ratio)), cv2.INTER_AREA)
-			Data = cv2.dnn.blobFromImage(cv2.resize(Frame, (300, 300)), 0.007843, (300, 300), 127.5)
+        #Update most recent frame in Frame Dictionary
+        FrameMap[CamName] = Frame
+        
+        #Construct the Montage from the Frames of every Active Camera
+        h, w = Frame.shape[:2]
+        Montage = Montagizer(FrameMap.values(), Frame.shape[:2], (MHeight, MWidth))
+        
+        #Send the Most Recent Processed Group of Frames Back to the User
+        FRAME = Montage
+        
+        #Testing
+        #cv2.imshow("Testing123...", Montage)
+        #cv2.waitKey(1)
 
-			#Pass the Data through the MobileNet SSD Object Detector and obtain Predictions
-			NN.setInput(Data)
-			Detections = NN.forward()
-			
-			for i in np.arange(Detections.shape[2]):
-				#Extract the Confidence Level (i.e. Probability) of the prediction
-				Confidence = Detections[0, 0, i, 2]
-				
-				#Supress Weak Predictions (those with a Confidence less than a specified threshold)
-				if Confidence >= CThreshold:
-					#Extract Class Index
-					index = int(Detections[0, 0, i, 1])
-					Class = CLASSES[index]
-					print("Detected Something!!!")
-					
-					#Extract BoundingBox Information
-					BBox = Detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-					x1, y1, x2, y2 = BBox.astype('int')
-					
-					#Draw the Box on the Image Frame
-					cv2.rectangle(Frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-					
-					#Label the Object on the Bounding Box
-					cv2.putText(Frame, Class, (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-					
-					#Save Test to File
-					cv2.imwrite("./Test.jpg", Frame)
-			
-			#Write the Device name to be displayed on the recieved Image Frame
-			cv2.putText(Frame, CamName, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    #Nuke any leftover Open Windows in the Program
+    #cv2.destroyAllWindows()
+    
+    return
 
-			#Update most recend frame in Frame Dictionary
-			FrameMap[CamName] = Frame
-			
-			#Construct the Montage from the Frames of every Active Camera
-			h, w = Frame.shape[:2]
-			Montages = Montagizer(FrameMap.values(), Frame.shape[:2], (MHeight, MWidth))
-			
-			#Display the montage(s) on screen
-			for i,Montage in enumerate(Montages):
-				cv2.imshow("Monitor {}:".format(i), Montage)
+def MessagePassing():
+    global STREAM
+    
+    # Send Data Back to Client
+    #SERVER_IP = "127.0.0.1" #Workstation User App
+    SERVER_IP = "10.3.12.70" #Rpi Uswer App #"172.24.118.97"
 
-			#cv2.imshow("Monitor 1", Frame)
-			cv2.waitKey(1)
-				
-			#Perform an Activity Check if enough time has passed to warrant one
-			if (datetime.now() - ActivityCheck).seconds > ACTIME:
-				#Check each device to determine if still active
-				for CamName,Time in list(ActiveCams.items()):
-					#Remove Camera from Active Set of Cameras if no recent activity
-					if (datetime.now() - Time).seconds > ACTIME:
-						print("Lost connection to {}...".format(CamName))
-						del FrameMap[CamName]
-						del ActiveCams[CamName]
-				
-				#Update most recent Activity Check Time to now
-				ActivityCheck = datetime.now()
-			
-		except Exception:
-			print("Either something went wrong or you killed the program. Either way shutting down...")
-			break
+    #Initialize Sender Object for the Server
+    print("Connecting to Client...")
+    sleep(10)
+    Sender = imagezmq.ImageSender(connect_to="tcp://{}:5570".format(SERVER_IP))
 
-	#Nuke any leftover Open Windows in the Program
-	cv2.destroyAllWindows()
+    #Obtain Hostname, initialize Video Stream, and Warm Up the Camera
+    ServerName = socket.gethostname()
+    
+    #Send the Processed Image Frames Back to the Client
+    while True:
+        try:
+            if FRAME is None:
+                continue
+            
+            Frame = FRAME
+            Sender.send_image(ServerName, Frame)
 
-#Montage Dimensions
-MWidth = 1
-MHeight = 1
+        except KeyboardInterrupt:
+            print("Shutting down...")
+            STREAM = False
+            break
 
 if __name__=='__main__':
-	Server(MWidth, MHeight, 0.70)
+    WebServer = Thread(target=Server)
+    WebServer.start()
+    MessagePassing()
+    WebServer.join()
+    #Server()
