@@ -6,6 +6,9 @@ from Estimation import Estimator
 import socket
 from time import sleep
 from threading import Thread
+#import caffe
+#caffe.set_mode_gpu()
+#caffe.set_device(0)
 
 #Much of the Object Detection and Message Passing Code here is adapted from Adrian Rosebrocks PyImageSearch Tuturials and ImUtils Library:
 #https://github.com/jrosebr1/imutils
@@ -144,7 +147,7 @@ def MessagePassing():
     
     # Send Data Back to Client
     #SERVER_IP = "127.0.0.1" #Workstation User App
-    SERVER_IP = "10.3.12.70" #Rpi Uswer App #"172.24.118.97"
+    SERVER_IP = "172.24.98.16" #Rpi User App #"172.24.118.97"
 
     #Initialize Sender Object for the Server
     print("Connecting to Client...")

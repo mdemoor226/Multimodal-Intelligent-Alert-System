@@ -44,8 +44,8 @@ def VideoServer():
     # We will be editing the Global Detection Dictionary
     global GDD
     
-    print("Standby, loading Object Detector...")
-    NN = cv.dnn.readNetFromCaffe("./../../Backend/MobileNetSSD_deploy.prototxt", "./../../Backend/MobileNetSSD_deploy.caffemodel")
+    #print("Standby, loading Object Detector...")
+    #NN = cv.dnn.readNetFromCaffe("./../../Backend/MobileNetSSD_deploy.prototxt", "./../../Backend/MobileNetSSD_deploy.caffemodel")
     
     #Initialize ImageHub
     print("Awaiting Incoming Connection...")
@@ -63,17 +63,17 @@ def VideoServer():
             GDD[CamName] = None
 
         #Resize the image frame to have a width of 400 pixels and then normalize the data before forwarding through the Neural Network
-        h, w = Frame.shape[:2]			
-        Ratio = 400.0 / float(w)
+        #h, w = Frame.shape[:2]			
+        #Ratio = 400.0 / float(w)
         #Frame = cv.resize(Frame, (400, int(h*Ratio)), cv.INTER_AREA)
-        Data = cv.dnn.blobFromImage(cv.resize(Frame, (300, 300)), 0.007843, (300, 300), 127.5)
+        #Data = cv.dnn.blobFromImage(cv.resize(Frame, (300, 300)), 0.007843, (300, 300), 127.5)
 
         #Pass the Data through the MobileNet SSD Object Detector and obtain Predictions
-        NN.setInput(Data)
-        Detections = NN.forward()
+        #NN.setInput(Data)
+        #Detections = NN.forward()
         
         #Update most recent frame detections in Global Detection Dictionary
-        GDD[CamName] = (Detections, Frame)
+        GDD[CamName] = (None, Frame) #(Detections, Frame)
     
     return
 		
@@ -124,7 +124,7 @@ class Database:
                 Mask = Result[0]['masks'][:,:,Index]
                 h,w = Mask.shape[0:2]
                 New = np.empty((h,w,3), dtype=np.float32)
-                New[:,:,np.arange(3)] = Mask
+                New[:,:,np.arange(3)] = np.expand_dims(Mask, axis=-1)
                 Img[New==0] = 0
 		
                 #Extract ORB Features
@@ -177,7 +177,7 @@ class Database:
 #CamLock2 = Lock()
 class Camera: 
     Tracker = None #{Cat: {Name : [Time, New Image] Queue}}
-    TCheck = None #{Cat: {Name : Time} Time Checkpoints for most recent Tracking update
+    TCheck = {} #{Cat: {Name : Time} Time Checkpoints for most recent Tracking update
     Model = None #Tensorflow Model
     #Server = "54.245.167.107:5000"
     #CameraID = 1
@@ -185,8 +185,8 @@ class Camera:
     def __init__(self, CamName, Ratio):
             self.Name = CamName #Name/Location
             self.MatchRatio = Ratio
-            self.TInterval = 60 # Minumum Number of Seconds to wait before adding another entry into the Tracker if Tracking an Object
-            self.FAST = True
+            self.TInterval = 1 # Minumum Number of Seconds to wait before adding another entry into the Tracker if Tracking an Object
+            self.FAST = False
             #self.ID = str(Camera.CameraID)
             #Camera.CameraID+=1
 
@@ -277,25 +277,29 @@ class Camera:
 
                         else:#Object is Trackable.
                             #Update the Tracker if enough time has passed since we last detected this object
-                            TCheck = datetime.now()
+                            TCheck = datetime.datetime.now()
+                            #print("Object is Trackable!!!")
                             if (TCheck - Camera.TCheck[class_names[ID]][name]).seconds > self.TInterval:
+                                #print("Trying to add Object to Tracker!!!")
                                 Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
                                 Camera.TCheck[class_names[ID]][name] = TCheck
                     
                     except KeyError:
                         NewQ = Queue(maxsize=Overwrite) if (Overwrite!=None) else Queue()
                         NewQ.put((Time, Img))
+                        print("New Category/Object!")
                         if(class_names[ID] not in Camera.Tracker):
+                            print("Adding new Queue!")
                             Camera.Tracker[class_names[ID]] = {name : NewQ}
-                            Camera.TCheck[class_names[ID]] = {name : datetime.now()}
+                            Camera.TCheck[class_names[ID]] = {name : datetime.datetime.now()}
                         else:
                             Camera.Tracker[class_names[ID]][name] = NewQ
-                            Camera.TCheck[class_names[ID]] = {name : datetime.now()}
+                            Camera.TCheck[class_names[ID]] = {name : datetime.datetime.now()}
                     
                     except queue.Full:
                         #Update the Tracker if enough time has passed since we last detected this object
                         #Also remove oldest detection from Tracking Queue because it's full
-                        TCheck = datetime.now()
+                        TCheck = datetime.datetime.now()
                         if (TCheck - Camera.TCheck[class_names[ID]][name]).seconds > self.TInterval:
                             Camera.Tracker[class_names[ID]][name].get()
                             Camera.Tracker[class_names[ID]][name].put((Time, Img), block=False)
@@ -355,6 +359,7 @@ class Camera:
         self.MatchRatio = Ratio
 
     def GetTracker(Category, Name):
+        print(Camera.Tracker)
         return Camera.Tracker[Category][Name]
 
     def SetTracker(Category, Name=None):
@@ -394,7 +399,7 @@ def DownloadServer():
 
     # Send Images back to User Application
     #SERVER_IP = "127.0.0.1" #Local workstation User App
-    SERVER_IP = "10.3.12.70" #Rpi User App #"172.24.118.97" #Change this as necessary
+    SERVER_IP = "172.24.98.16" #Rpi User App #"172.24.118.97" #Change this as necessary
 
     #Initialize Sender Object for the Server
     print("Download Server Connecting to User...")
@@ -407,7 +412,8 @@ def DownloadServer():
     #Send the Processed Image Frames Back to the Client
     while not SHUTDOWN:
         with DLock:
-            for DownloadFRAME in DOWNLOADFRAMES:      
+            for DownloadFRAME in DOWNLOADFRAMES:
+                print("Sending Image!!!")
                 Sender.send_image(ServerName, DownloadFRAME)
         
         DOWNLOADFRAMES.clear()
@@ -468,6 +474,7 @@ class User:
             #Add New Object Information to Database
             ########Logic needs to be added here to determine what to do if no categories are detected in the user provided image##############
             DB.SetObjDict(Category, Name, Camera.Model, Img, Thresh, CThresh, int(Status))
+            Camera.TCheck[Category] = {Name: datetime.datetime.now()}
 
             #Confirmation Message
             self.Client.send(bytes("Image successfully uploaded and features successfully extracted.", "utf8"))				
@@ -509,18 +516,19 @@ class User:
                 
                     #Send the Frames Back to the User
                     sleep(5)
-                    DOWNLOADFRAMES = Images
+                    DOWNLOADFRAMES = Images.copy()
                     
                 #Confirmation Message
                 self.Client.send(bytes("Object information retrieved.", "utf8"))
-            except KeyError:
+            except KeyboardInterrupt:#Error:
                 #Error Message
                 self.Client.send(bytes("Error, object does not exist.", "utf8"))
             finally:
                 #Release Threads
                 self.Check = 0
                 self.Command = 1
-    
+
+    #TODO: Update this method to remove the respective item(s) from the TCheck Data Structure as well
     def __Clear(self, Data, Threads):
             #Clear appropriate areas of Camera Tracker for Objects
             Category = Data[1].lower()
